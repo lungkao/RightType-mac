@@ -1,0 +1,308 @@
+//! Word dictionaries used to decide whether a token is a real word.
+//!
+//! Hashed membership. The words are borrowed from the program itself (the
+//! bundled lists are compiled in), not copied one by one: a word is copied
+//! only when its lookup form differs (an English word with capitals), and
+//! that copy lives as long as the program, as the dictionary does. This
+//! took the dictionaries' heap from 10.2 MB to about 6
+//! (`examples/startup_cost.rs`, docs/TYPING_BENCHMARK.md).
+
+use std::collections::HashSet;
+use std::sync::{OnceLock, RwLock};
+
+/// A set of known words for one language, normalized for case-insensitive lookup.
+///
+/// Alongside the membership set it keeps the same words sorted, so it can also
+/// answer *"could this token still grow into a word?"* — the question the live
+/// correction path has to ask before it may destroy an in-flight token.
+pub struct Dictionary {
+    words: HashSet<&'static str>,
+    /// Built on first prefix query only. Membership never needs it, and only
+    /// the English list is ever asked for continuations, so the Thai list never
+    /// pays for an index nobody reads — which matters against the resident-memory
+    /// target in `docs/archive/PLAN.md`.
+    sorted: OnceLock<Vec<&'static str>>,
+    /// Words the user taught at runtime (auto-learn). Kept apart from the
+    /// bundled list so they can be forgotten wholesale and so the sorted
+    /// prefix index never has to be rebuilt; the overlay stays small enough
+    /// that scanning it for continuations is cheaper than any index.
+    overlay: RwLock<HashSet<String>>,
+}
+
+impl Dictionary {
+    /// Build a dictionary from any iterator of words. The words are kept
+    /// for the life of the program: meant for fixed lists (and tests), not
+    /// for words that come and go (those are learned, see [`Self::learn`]).
+    pub fn from_words<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_keys(iter.into_iter().map(|s| {
+            let key = normalize(s.as_ref());
+            &*Box::leak(key.into_boxed_str())
+        }))
+    }
+
+    /// Build a dictionary from words that live as long as the program (the
+    /// bundled lists): borrowed, not copied, when already in lookup form.
+    pub fn from_static(iter: impl IntoIterator<Item = &'static str>) -> Self {
+        Self::from_keys(iter.into_iter().map(|s| {
+            let t = s.trim();
+            if t.chars().any(char::is_uppercase) {
+                &*Box::leak(normalize(t).into_boxed_str())
+            } else {
+                t
+            }
+        }))
+    }
+
+    fn from_keys(keys: impl Iterator<Item = &'static str>) -> Self {
+        Self {
+            words: keys.filter(|s| !s.is_empty()).collect(),
+            sorted: OnceLock::new(),
+            overlay: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Is `word` a known word (case-insensitive)? Learned words count.
+    pub fn contains(&self, word: &str) -> bool {
+        let key = normalize(word);
+        self.words.contains(key.as_str()) || self.overlay_contains(&key)
+    }
+
+    /// Teach this dictionary a word at runtime. Returns `true` if it was new.
+    pub fn learn(&self, word: &str) -> bool {
+        let key = normalize(word);
+        if key.is_empty() || self.words.contains(key.as_str()) {
+            return false;
+        }
+        self.overlay
+            .write()
+            .map(|mut o| o.insert(key))
+            .unwrap_or(false)
+    }
+
+    /// Forget every runtime-learned word; the bundled list is untouched.
+    pub fn forget_learned(&self) {
+        if let Ok(mut o) = self.overlay.write() {
+            o.clear();
+        }
+    }
+
+    /// Was this word learned at runtime (rather than bundled)?
+    pub fn is_learned(&self, word: &str) -> bool {
+        self.overlay_contains(&normalize(word))
+    }
+
+    fn overlay_contains(&self, key: &str) -> bool {
+        self.overlay
+            .read()
+            .map(|o| o.contains(key))
+            .unwrap_or(false)
+    }
+
+    /// Is there a known word that **starts with** `prefix` but is longer than it?
+    ///
+    /// This is the "live continuation" test. A token that can still grow into a
+    /// real word is not yet evidence of anything: `diffe` is not an English word,
+    /// but it is on the way to `different`, so converting it is destructive
+    /// rather than helpful. Answered by binary search over the sorted words, so
+    /// it costs a handful of comparisons and no extra allocation per query.
+    pub fn has_extension(&self, prefix: &str) -> bool {
+        let prefix = normalize(prefix);
+        if prefix.is_empty() {
+            return false;
+        }
+        let sorted = self.sorted();
+        let from = sorted.partition_point(|w| *w < prefix.as_str());
+        sorted[from..]
+            .iter()
+            .take_while(|w| w.starts_with(prefix.as_str()))
+            .any(|w| *w != prefix.as_str())
+            || self.overlay.read().is_ok_and(|o| {
+                o.iter()
+                    .any(|w| w.len() > prefix.len() && w.starts_with(prefix.as_str()))
+            })
+    }
+
+    /// The letters every known word starting with `prefix` goes on with —
+    /// the longest beginning they share — when that is at least `at_least`
+    /// more characters. Never a guess: whichever word is meant, it starts
+    /// with what this gives (`ประชาสัมพั` → `ประชาสัมพันธ์`; `สวัส` gives
+    /// nothing, since สวัสดี and สวัสดิการ part at once).
+    pub fn sure_completion(&self, prefix: &str, at_least: usize) -> Option<String> {
+        let prefix = normalize(prefix);
+        if prefix.is_empty() {
+            return None;
+        }
+        let sorted = self.sorted();
+        let from = sorted.partition_point(|w| *w < prefix.as_str());
+        let mut common: Option<Vec<char>> = None;
+        for w in sorted[from..]
+            .iter()
+            .take_while(|w| w.starts_with(prefix.as_str()))
+        {
+            let chars: Vec<char> = w.chars().collect();
+            common = Some(match common {
+                None => chars,
+                Some(c) => c
+                    .iter()
+                    .zip(&chars)
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| *a)
+                    .collect(),
+            });
+        }
+        let common: String = common?.into_iter().collect();
+        (common.chars().count() >= prefix.chars().count() + at_least).then_some(common)
+    }
+
+    /// The words in order, for prefix questions (built on the first).
+    fn sorted(&self) -> &[&'static str] {
+        self.sorted.get_or_init(|| {
+            let mut v: Vec<&'static str> = self.words.iter().copied().collect();
+            v.sort_unstable();
+            v
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+}
+
+/// Normalize a word for lookup: trim and lowercase. Lowercasing is a no-op for
+/// Thai script, and folds English case so `Correct` matches `correct`.
+fn normalize(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// Bundled English dictionary (common words).
+pub fn english() -> &'static Dictionary {
+    static D: OnceLock<Dictionary> = OnceLock::new();
+    D.get_or_init(|| {
+        Dictionary::from_static(
+            include_str!("../assets/en_words.txt")
+                .lines()
+                .chain(tech_terms()),
+        )
+    })
+}
+
+/// The bundled technical terms (`assets/tech_terms.txt`) in their usual
+/// casing: programming languages, frameworks, models, products, acronyms.
+pub fn tech_terms() -> impl Iterator<Item = &'static str> {
+    include_str!("../assets/tech_terms.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// The bundled Thai words, as listed (practice text is made from them).
+pub fn thai_words() -> impl Iterator<Item = &'static str> {
+    include_str!("../assets/th_words.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// The bundled English words, as listed.
+pub fn english_words() -> impl Iterator<Item = &'static str> {
+    include_str!("../assets/en_words.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// Bundled Thai dictionary.
+pub fn thai() -> &'static Dictionary {
+    static D: OnceLock<Dictionary> = OnceLock::new();
+    D.get_or_init(|| Dictionary::from_static(include_str!("../assets/th_words.txt").lines()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_is_case_insensitive() {
+        let d = Dictionary::from_words(["Correct", "hello"]);
+        assert!(d.contains("correct"));
+        assert!(d.contains("CORRECT"));
+        assert!(!d.contains("nope"));
+        assert_eq!(d.len(), 2);
+    }
+
+    #[test]
+    fn has_extension_finds_live_continuations() {
+        let d = Dictionary::from_words(["different", "differ", "hello", "ok"]);
+        // On the way to a longer word.
+        assert!(d.has_extension("diffe"));
+        assert!(d.has_extension("differ")); // exact word that still extends
+        assert!(d.has_extension("hell"));
+        // Complete and terminal: nothing longer starts with these.
+        assert!(!d.has_extension("different"));
+        assert!(!d.has_extension("hello"));
+        assert!(!d.has_extension("ok"));
+        // Not on the way to anything.
+        assert!(!d.has_extension("zzz"));
+        assert!(!d.has_extension(""));
+        // Case-insensitive, like membership.
+        assert!(d.has_extension("DIFFE"));
+    }
+
+    #[test]
+    fn has_extension_matches_the_bundled_english_list() {
+        let en = english();
+        assert!(en.has_extension("diffe"));
+        assert!(en.has_extension("compu"));
+        assert!(en.has_extension("wri"));
+        assert!(!en.has_extension("qqqq"));
+    }
+
+    #[test]
+    fn learned_words_join_membership_and_continuations() {
+        let d = Dictionary::from_words(["hello"]);
+        assert!(!d.contains("kubernetes"));
+        assert!(d.learn("Kubernetes"));
+        assert!(!d.learn("kubernetes"), "learning twice is a no-op");
+        assert!(!d.learn("hello"), "bundled words are never re-learned");
+        assert!(d.contains("kubernetes"));
+        assert!(d.is_learned("kubernetes"));
+        assert!(d.has_extension("kuber"));
+        d.forget_learned();
+        assert!(!d.contains("kubernetes"));
+        assert!(!d.has_extension("kuber"));
+        assert!(d.contains("hello"));
+    }
+
+    #[test]
+    fn bundled_lists_load_and_contain_basics() {
+        assert!(english().contains("correct"));
+        assert!(english().len() > 1000);
+        assert!(thai().len() > 1000);
+        assert!(thai().contains("สวัสดี"));
+    }
+
+    #[test]
+    fn completion_is_only_what_every_word_shares() {
+        let d = Dictionary::from_words(["ประชาสัมพันธ์", "สวัสดี", "สวัสดิการ", "hello"]);
+        assert_eq!(
+            d.sure_completion("ประชาสัมพั", 2).as_deref(),
+            Some("ประชาสัมพันธ์")
+        );
+        assert_eq!(d.sure_completion("สวัส", 2), None);
+        assert_eq!(d.sure_completion("hel", 5), None);
+        assert_eq!(d.sure_completion("hel", 2).as_deref(), Some("hello"));
+        assert_eq!(d.sure_completion("xyz", 1), None);
+        // With the bundled list: a long word, a common start.
+        let th = thai();
+        assert!(th.sure_completion("ประชาสัมพั", 2).is_some());
+        assert_eq!(th.sure_completion("สวัส", 2), None);
+    }
+}

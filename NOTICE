@@ -1,0 +1,6 @@
+RightType for macOS is a derivative work of RightType
+https://github.com/k-affan-th/RightType
+Copyright (c) 2026 RightType contributors, licensed MIT OR Apache-2.0.
+
+The original source (src/, assets/, docs/, e2e/, packaging/, tools/ and the
+root files) comes from that project. Additions for macOS live in macos/.

@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+e2e/.venv/
+e2e/shots/
+__pycache__/
+e2e/rt_stderr.log
+e2e/probe_out.txt
+e2e/probe_err.txt
+# Release artifacts are published as GitHub Release assets, not committed.
+/dist/
+# Local E2E run output
+e2e/*.log
+
+# macOS build output
+/macos/build/
+/macos/ffi/target/
+.DS_Store

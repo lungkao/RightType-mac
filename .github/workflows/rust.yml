@@ -1,0 +1,176 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore: [ "docs/**", "**.md" ]
+  pull_request:
+    branches: [ "main" ]
+    paths-ignore: [ "docs/**", "**.md" ]
+
+# A new push to a pull request stops the runs of the commits before it:
+# only the newest commit's result counts, and the Windows typing tests take
+# half an hour.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The OS-free core: layout, detection, policy and the pipeline replays.
+  core:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Format
+      run: cargo fmt --all -- --check
+    - name: Whitespace
+      run: git diff --check $(git hash-object -t tree /dev/null) HEAD
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Test
+      run: cargo test --all-targets
+    - name: Latency gate
+      run: cargo run --release --example policy_latency
+    # RightType 2.0 quality gate: no correctly typed dictionary word, phrase or
+    # benchmark word may be changed, and recall may not fall below its floor.
+    - name: False-positive audit
+      run: cargo run --release --example false_positive_audit -- --check
+    - name: Typing benchmark
+      run: cargo run --release --example typing_benchmark -- --check
+
+  # The Windows integration layer (hook, inject, tray, ...). It only compiles
+  # on Windows, so the Linux job above never sees it.
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Clippy
+      run: cargo clippy --features winos --all-targets -- -D warnings
+    - name: Test
+      run: cargo test --features winos --all-targets
+    - name: Release build
+      run: cargo build --release --features winos
+    # Build the installer and zip exactly as a release would, so a broken
+    # packaging script or .iss is caught on the PR, not on release day.
+    - name: Install Inno Setup
+      run: choco install innosetup --no-progress -y
+    - name: Package
+      shell: pwsh
+      run: |
+        ./packaging/build_release.ps1
+        # build_release.ps1 skips the installer when Inno Setup is missing;
+        # here it must exist.
+        if (-not (Get-ChildItem dist -Filter "RightType-*-setup.exe")) { throw "setup.exe was not built" }
+    # Windows on ARM (Surface Pro X / Copilot+ PCs): cross-built here,
+    # tested on an ARM runner below.
+    - name: Package for ARM64
+      shell: pwsh
+      run: |
+        rustup target add aarch64-pc-windows-msvc
+        ./packaging/build_release.ps1 -Arch arm64
+        if (-not (Get-ChildItem dist -Filter "RightType-*-arm64-setup.exe")) { throw "arm64 setup.exe was not built" }
+    # The installers of every PR, to try a fix on a real PC before a release.
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: RightType-setup-${{ github.sha }}
+        path: dist/RightType-*-setup.exe
+        retention-days: 14
+    - name: No network or telemetry crates
+      shell: pwsh
+      run: |
+        $tree = cargo tree --features winos --edges normal --prefix none
+        $bad = $tree | Select-String -Pattern '^(reqwest|hyper|ureq|curl|isahc|surf|attohttpc|tokio|native-tls|rustls|openssl|sentry|opentelemetry)\b'
+        if ($bad) { $bad; throw "network/telemetry crate in the dependency tree" }
+
+  # The same tests on Windows on ARM, natively.
+  windows-arm:
+    runs-on: windows-11-arm
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Test
+      run: cargo test --features winos --all-targets
+
+  # Real apps, real keys: a debug build of RightType in Chrome (a page's text
+  # box and the address bar) and Notepad on a Windows desktop, with the text
+  # read back through UI Automation. Unit tests and the simulator cannot see
+  # what an app does with the keys RightType sends; this can.
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build (debug, accepts the test's injected keys)
+      run: cargo build --features winos
+    # For diagnosing on a real PC: this build writes what it sees to stderr
+    # when RIGHTTYPE_E2E_ACCEPT_INJECTED is set.
+    - name: Upload diagnostic build
+      uses: actions/upload-artifact@v4
+      with:
+        name: righttype-diagnostic-${{ github.sha }}
+        path: target/debug/righttype.exe
+        retention-days: 7
+    # The one-click self-test for a real PC: this build, the e2e scripts and
+    # test-on-my-pc.bat in one zip (unzip, double-click the .bat); preview-ui.bat
+    # opens one window for a look without the test.
+    - name: Package self-test
+      shell: pwsh
+      run: |
+        $dir = "selftest"
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Copy-Item target/debug/righttype.exe $dir
+        Copy-Item e2e/*.py, e2e/target.html, e2e/test-on-my-pc.bat, e2e/preview-ui.bat $dir
+    - name: Upload self-test
+      uses: actions/upload-artifact@v4
+      with:
+        name: RightType-selftest-${{ github.sha }}
+        path: selftest
+        retention-days: 14
+    - name: Add the Thai keyboard
+      shell: pwsh
+      run: |
+        $list = Get-WinUserLanguageList
+        $list.Add("th-TH")
+        Set-WinUserLanguageList $list -Force
+        Get-WinUserLanguageList | Format-Table LanguageTag, InputMethodTips
+    # Windows 11's Notepad (a Store app; the runner only has the classic
+    # one). Best effort: without it the notepad11 target is skipped.
+    - name: Windows 11 Notepad
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        winget install --id 9MSMLRH6LZF3 --source msstore --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        Get-AppxPackage *WindowsNotepad* | Format-Table Name, Version
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Test tools
+      run: python -m pip install --quiet "pywinauto>=0.6.9" "mss>=10"
+    - name: Type in real apps
+      working-directory: e2e
+      env:
+        TEMP: ${{ runner.temp }}
+        TMP: ${{ runner.temp }}
+        PYTHONIOENCODING: utf-8
+      run: python ci_sweep.py
+    - name: Upload trace
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-trace-${{ github.sha }}
+        path: ${{ runner.temp }}/rt_sweep_*/rt.log
+        if-no-files-found: ignore
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+    - name: Audit
+      run: cargo audit
