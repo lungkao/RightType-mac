@@ -37,5 +37,5 @@ S=build/dist/RightType-mac-$VER; mkdir -p $S
 cp -R build/dist/RightType.app $S/
 cp ../LICENSE-MIT ../LICENSE-APACHE ../NOTICE $S/
 cp INSTALL-TH.txt $S/"อ่านก่อน.txt"
-(cd build/dist && ditto -c -k --keepParent RightType-mac-$VER RightType-mac-$VER.zip)
+(cd build/dist && ditto -c -k --norsrc --noextattr --keepParent RightType-mac-$VER RightType-mac-$VER.zip)
 echo "Built: $(pwd)/build/dist/RightType-mac-$VER.zip"
