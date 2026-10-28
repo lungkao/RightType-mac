@@ -1,5 +1,7 @@
 # RightType for macOS (menu-bar app)
 
+ภาพรวมและวิธีติดตั้งอยู่ใน [README หลัก](../README.md) · ☕ [Buy me a coffee](https://buymeacoffee.com/cheuachatchai)
+
 พิมพ์ผิดภาษา แก้ให้เอง — เวอร์ชัน macOS แบบแอปเมนูบาร์
 
 A macOS menu-bar port of [RightType](https://github.com/k-affan-th/RightType)
